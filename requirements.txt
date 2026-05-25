@@ -1,0 +1,5 @@
+# This project intentionally has no third-party Python dependencies.
+# Everything runs on the standard library (heapq, tkinter, random, unittest).
+#
+# Tkinter is *not* a pip package -- it must be enabled in the Python
+# interpreter itself. See README.md for OS-specific install steps.
