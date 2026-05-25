@@ -9,12 +9,19 @@ Public API:
 """
 
 from .graph import Graph
-from .dijkstra import dijkstra, multi_source_costs
+from .dijkstra import (
+    dijkstra,
+    dijkstra_with_paths,
+    multi_source_costs,
+    reconstruct_path,
+)
 from .cost_matrix import build_cost_matrix, UNREACHABLE
 
 __all__ = [
     "Graph",
     "dijkstra",
+    "dijkstra_with_paths",
+    "reconstruct_path",
     "multi_source_costs",
     "build_cost_matrix",
     "UNREACHABLE",

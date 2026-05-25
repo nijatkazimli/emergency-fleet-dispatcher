@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import heapq
 import math
-from typing import Dict, Hashable, Iterable, List
+from typing import Dict, Hashable, Iterable, List, Optional, Tuple
 
 from .graph import Graph
 
@@ -63,3 +63,50 @@ def multi_source_costs(
         dist = dijkstra(graph, s)
         matrix.append([dist.get(t, math.inf) for t in targets])
     return matrix
+
+
+def dijkstra_with_paths(
+    graph: Graph, source: Node
+) -> Tuple[Dict[Node, float], Dict[Node, Optional[Node]]]:
+    """Same as `dijkstra` but also returns a predecessor map for path reconstruction.
+
+    Returns
+    -------
+    (dist, prev)
+        dist[node]  -- shortest travel time from `source` to `node`
+        prev[node]  -- previous node on the shortest path (None for the source)
+    """
+    if source not in graph:
+        raise KeyError(f"Source node {source!r} is not in the graph.")
+
+    dist: Dict[Node, float] = {source: 0.0}
+    prev: Dict[Node, Optional[Node]] = {source: None}
+    heap: List[tuple] = [(0.0, source)]
+
+    while heap:
+        d, u = heapq.heappop(heap)
+        if d > dist[u]:
+            continue
+        for v, w in graph.neighbors(u):
+            nd = d + w
+            if nd < dist.get(v, math.inf):
+                dist[v] = nd
+                prev[v] = u
+                heapq.heappush(heap, (nd, v))
+    return dist, prev
+
+
+def reconstruct_path(prev: Dict[Node, Optional[Node]], target: Node) -> List[Node]:
+    """Rebuild the node-by-node path from a `prev` map produced by `dijkstra_with_paths`.
+
+    Returns an empty list if `target` is unreachable.
+    """
+    if target not in prev:
+        return []
+    path: List[Node] = []
+    cur: Optional[Node] = target
+    while cur is not None:
+        path.append(cur)
+        cur = prev[cur]
+    path.reverse()
+    return path
