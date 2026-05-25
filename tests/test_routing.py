@@ -10,6 +10,7 @@ import unittest
 
 from routing import Graph, build_cost_matrix, dijkstra, multi_source_costs, UNREACHABLE
 from routing.city_generator import build_grid_city, node_id
+from routing.dijkstra import dijkstra_with_paths, reconstruct_path
 
 
 class DijkstraTests(unittest.TestCase):
@@ -71,6 +72,77 @@ class CostMatrixTests(unittest.TestCase):
         raw = multi_source_costs(g, [0], [1, 2])
         self.assertEqual(raw[0][0], 1.0)
         self.assertTrue(math.isinf(raw[0][1]))
+
+
+class EarlyTerminationTests(unittest.TestCase):
+    def test_targets_results_match_full_search(self):
+        # Distances to requested targets must be bit-identical whether we
+        # ask Dijkstra to run to completion or to bail out early.
+        city = build_grid_city(6, 6, seed=42)
+        src = node_id((0, 0), 6)
+        tgts = [node_id((5, 5), 6), node_id((2, 3), 6), node_id((4, 1), 6)]
+        full_d, _ = dijkstra_with_paths(city, src)
+        part_d, _ = dijkstra_with_paths(city, src, targets=tgts)
+        for t in tgts:
+            self.assertEqual(part_d[t], full_d[t])
+
+    def test_targets_can_skip_unreachable(self):
+        # An unreachable target must not prevent early termination once
+        # the reachable ones are settled.
+        g = Graph()
+        g.add_edge(0, 1, 1.0)
+        g.add_edge(1, 2, 1.0)
+        g.add_node(99)  # isolated
+        dist, prev = dijkstra_with_paths(g, 0, targets=[2, 99])
+        self.assertEqual(dist[2], 2.0)
+        self.assertNotIn(99, dist)
+        self.assertEqual(reconstruct_path(prev, 2), [0, 1, 2])
+
+    def test_targets_explores_fewer_nodes(self):
+        # On a large grid, targeted search must settle strictly fewer
+        # nodes than a full traversal (the whole point of the option).
+        city = build_grid_city(10, 10, seed=7)
+        src = node_id((0, 0), 10)
+        tgts = [node_id((1, 1), 10)]
+        full_d, _ = dijkstra_with_paths(city, src)
+        part_d, _ = dijkstra_with_paths(city, src, targets=tgts)
+        self.assertLess(len(part_d), len(full_d))
+
+
+class CostMatrixPathsTests(unittest.TestCase):
+    def test_return_paths_keeps_default_matrix_intact(self):
+        # The default (positional) call must still return ONLY the
+        # cost matrix -- the partner's contract is unchanged.
+        city = build_grid_city(3, 3)
+        a = [node_id((0, 0), 3)]
+        e = [node_id((2, 2), 3)]
+        matrix_only = build_cost_matrix(city, a, e)
+        self.assertIsInstance(matrix_only, list)
+        self.assertEqual(matrix_only[0][0], 4)
+
+    def test_return_paths_yields_reconstructable_prev_maps(self):
+        city = build_grid_city(4, 4, seed=1)
+        ambs = [node_id((0, 0), 4), node_id((3, 3), 4)]
+        emes = [node_id((0, 3), 4), node_id((3, 0), 4)]
+        cost, prev_by_source = build_cost_matrix(
+            city, ambs, emes, return_paths=True
+        )
+        # Every requested ambulance got a prev-map.
+        self.assertEqual(set(prev_by_source.keys()), set(ambs))
+        # Reconstructed path cost equals the matrix cell.
+        for i, src in enumerate(ambs):
+            for j, dst in enumerate(emes):
+                path = reconstruct_path(prev_by_source[src], dst)
+                if cost[i][j] >= UNREACHABLE:
+                    continue
+                # Sum of weights along the reconstructed path matches.
+                total = 0.0
+                for u, v in zip(path, path[1:]):
+                    for nb, w in city.neighbors(u):
+                        if nb == v:
+                            total += w
+                            break
+                self.assertAlmostEqual(total, cost[i][j])
 
 
 if __name__ == "__main__":
