@@ -142,6 +142,16 @@ class DispatcherApp(tk.Tk):
         self._anim_running: bool = False
         self._anim_start: float = 0.0
 
+        # Per-dispatch Dijkstra cache: ambulance node -> prev-map. Filled
+        # by dispatch() (one Dijkstra per ambulance, with early
+        # termination on the emergency set). _build_routes() and _redraw()
+        # reuse it instead of each re-running N Dijkstras.
+        self._prev_cache: Dict[int, Dict[Any, Any]] = {}
+
+        # O(1) edge-weight lookup for _redraw, rebuilt on regenerate_city.
+        # Replaces the O(deg) linear scan over `city.neighbors(u)`.
+        self._edge_w: Dict[Tuple[int, int], float] = {}
+
         self._build_widgets()
         self.regenerate_city()
         self.place_units()
@@ -264,6 +274,7 @@ class DispatcherApp(tk.Tk):
     def regenerate_city(self) -> None:
         self._stop_animation()
         self.routes = []
+        self._prev_cache = {}
         if hasattr(self, "play_btn"):
             self.play_btn.state(["disabled"])
         seed = random.randint(0, 10_000)
@@ -279,11 +290,17 @@ class DispatcherApp(tk.Tk):
         self.closures = closures
         self.city = build_grid_city(self.rows, self.cols, closed_edges=closures, seed=seed)
 
-        # Pre-compute min/max edge weight for legend + colour scaling.
+        # Pre-compute min/max edge weight for legend + colour scaling,
+        # and snapshot every edge into an (u,v) -> w dict for O(1) lookup
+        # during _redraw (was an O(deg) linear scan over neighbors).
         weights: List[float] = []
+        edge_w: Dict[Tuple[int, int], float] = {}
         for u in self.city.nodes():
-            for _v, w in self.city.neighbors(u):
+            u_i = cast(int, u)
+            for v, w in self.city.neighbors(u):
                 weights.append(w)
+                edge_w[(u_i, cast(int, v))] = w
+        self._edge_w = edge_w
         self.w_min = min(weights) if weights else 1.0
         self.w_max = max(weights) if weights else 1.0
         self.legend.config(
@@ -295,6 +312,7 @@ class DispatcherApp(tk.Tk):
     def place_units(self) -> None:
         self._stop_animation()
         self.routes = []
+        self._prev_cache = {}
         self.play_btn.state(["disabled"])
         all_cells = [(r, c) for r in range(self.rows) for c in range(self.cols)]
         random.shuffle(all_cells)
@@ -331,8 +349,20 @@ class DispatcherApp(tk.Tk):
         eme_nodes = [node_id(self.emergency_coords[i], self.cols)
                      for i in dispatched_indices]
 
-        # ---- Algorithm A: cost matrix -----------------------------------
-        cost = build_cost_matrix(self.city, amb_nodes, eme_nodes)
+        # ---- Algorithm A: cost matrix + path cache in one pass ---------
+        # build_cost_matrix(return_paths=True) runs Dijkstra ONCE per
+        # ambulance with the emergency set as targets (early termination),
+        # and hands back the predecessor maps so _build_routes and
+        # _redraw can reconstruct the actual shortest paths without any
+        # further Dijkstra work. Previously dispatch + redraw together
+        # ran 3 * N Dijkstras; now it runs N.
+        cost, prev_by_source = cast(
+            Tuple[List[List[float]], Dict[Any, Dict[Any, Any]]],
+            build_cost_matrix(
+                self.city, amb_nodes, eme_nodes, return_paths=True
+            ),
+        )
+        self._prev_cache = {cast(int, s): p for s, p in prev_by_source.items()}
 
         # ---- Algorithm B: placeholder -----------------------------------
         if self.strategy.get().startswith("greedy"):
@@ -372,7 +402,9 @@ class DispatcherApp(tk.Tk):
             color = PATH_COLORS[k % len(PATH_COLORS)]
             src = node_id(self.ambulance_coords[i], self.cols)
             dst = node_id(self.emergency_coords[j], self.cols)
-            _, prev = dijkstra_with_paths(self.city, src)
+            prev = self._prev_cache.get(src)
+            if prev is None:  # defensive: cache miss => recompute.
+                _, prev = dijkstra_with_paths(self.city, src, targets=[dst])
             path_nodes = reconstruct_path(prev, dst)
             if len(path_nodes) < 2:
                 continue
@@ -540,7 +572,9 @@ class DispatcherApp(tk.Tk):
 
                 src = node_id(self.ambulance_coords[i], self.cols)
                 dst = node_id(self.emergency_coords[j], self.cols)
-                _, prev = dijkstra_with_paths(self.city, src)
+                prev = self._prev_cache.get(src)
+                if prev is None:  # defensive: cache miss => recompute.
+                    _, prev = dijkstra_with_paths(self.city, src, targets=[dst])
                 path_nodes = reconstruct_path(prev, dst)
                 if len(path_nodes) < 2:
                     continue
@@ -593,6 +627,12 @@ class DispatcherApp(tk.Tk):
         return PADDING + c * CELL_PX, PADDING + r * CELL_PX
 
     def _edge_weight(self, u: int, v: int) -> float | None:
+        # O(1) lookup via the precomputed adjacency dict (built in
+        # regenerate_city). Falls back to a linear scan if the cache
+        # has not been populated yet (e.g. during very early init).
+        w = self._edge_w.get((u, v))
+        if w is not None:
+            return w
         for nb, w in self.city.neighbors(u):
             if nb == v:
                 return w
