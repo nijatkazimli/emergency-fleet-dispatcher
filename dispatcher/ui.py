@@ -130,6 +130,14 @@ class DispatcherApp(tk.Tk):
         self.n_emergencies = tk.IntVar(value=3)
         self.strategy = tk.StringVar(value="random (placeholder)")
 
+        # Resizable city dimensions, driven by the toolbar Rows/Cols spinboxes.
+        self.grid_rows = tk.IntVar(value=rows)
+        self.grid_cols = tk.IntVar(value=cols)
+
+        # Animation speed multiplier: sim seconds per wall second.
+        # Changes take effect on the next tick, mid-animation included.
+        self.sim_speed = tk.DoubleVar(value=5.0)
+
         # Initialised by place_units(); declared up-front so the first
         # regenerate_city() -> _redraw() call has something to draw.
         self.ambulance_coords: List[Coord] = []
@@ -140,7 +148,19 @@ class DispatcherApp(tk.Tk):
         # Animation state (populated by dispatch(), driven by play_animation()).
         self.routes: List[Dict[str, Any]] = []
         self._anim_running: bool = False
-        self._anim_start: float = 0.0
+        # Sim-time accumulator (sim seconds elapsed since play_animation()).
+        # Using an accumulator instead of (now - start) * speed lets the user
+        # change sim_speed mid-animation without time-jumps.
+        self._anim_sim_t: float = 0.0
+        self._anim_last_wall: float = 0.0
+        # Active arrival pulses: {x, y, color, start_wall}. Each one is
+        # drawn for ~600 ms wall time and then pruned.
+        self._pulses: List[Dict[str, Any]] = []
+
+        # Last-known totals for the side-by-side strategy comparison
+        # footer. Filled in by dispatch().
+        self._random_total: float | None = None
+        self._greedy_total: float | None = None
 
         # Per-dispatch Dijkstra cache: ambulance node -> prev-map. Filled
         # by dispatch() (one Dijkstra per ambulance, with early
@@ -202,14 +222,30 @@ class DispatcherApp(tk.Tk):
         )
 
         ttk.Label(top, text="  Ambulances:").pack(side=tk.LEFT)
-        amb_spin = ttk.Spinbox(top, from_=1, to=8, width=3, textvariable=self.n_ambulances)
+        amb_spin = ttk.Spinbox(top, from_=1, to=12, width=3, textvariable=self.n_ambulances)
         amb_spin.pack(side=tk.LEFT)
         Tooltip(amb_spin, "Number of ambulances. Takes effect on the next Place units.")
 
         ttk.Label(top, text="  Emergencies:").pack(side=tk.LEFT)
-        emg_spin = ttk.Spinbox(top, from_=1, to=8, width=3, textvariable=self.n_emergencies)
+        emg_spin = ttk.Spinbox(top, from_=1, to=12, width=3, textvariable=self.n_emergencies)
         emg_spin.pack(side=tk.LEFT)
         Tooltip(emg_spin, "Number of emergency calls. If it exceeds ambulances, triage queues the rest.")
+
+        ttk.Label(top, text="  Rows:").pack(side=tk.LEFT)
+        rows_spin = ttk.Spinbox(
+            top, from_=4, to=16, width=3,
+            textvariable=self.grid_rows, command=self._on_size_change,
+        )
+        rows_spin.pack(side=tk.LEFT)
+        Tooltip(rows_spin, "City height (rows). Changing this rebuilds the city.")
+
+        ttk.Label(top, text="  Cols:").pack(side=tk.LEFT)
+        cols_spin = ttk.Spinbox(
+            top, from_=4, to=16, width=3,
+            textvariable=self.grid_cols, command=self._on_size_change,
+        )
+        cols_spin.pack(side=tk.LEFT)
+        Tooltip(cols_spin, "City width (columns). Changing this rebuilds the city.")
 
         ttk.Label(top, text="  Strategy:").pack(side=tk.LEFT)
         strat_box = ttk.Combobox(
@@ -221,6 +257,17 @@ class DispatcherApp(tk.Tk):
         )
         strat_box.pack(side=tk.LEFT)
         Tooltip(strat_box, "Assignment policy. Swap for the partner's Hungarian solver when ready.")
+
+        ttk.Label(top, text="  Speed:").pack(side=tk.LEFT)
+        self.speed_label = ttk.Label(top, text="5.0x", width=5)
+        speed_scale = ttk.Scale(
+            top, from_=1.0, to=20.0, length=120,
+            variable=self.sim_speed, orient=tk.HORIZONTAL,
+            command=lambda v: self.speed_label.config(text=f"{float(v):.1f}x"),
+        )
+        speed_scale.pack(side=tk.LEFT, padx=(2, 0))
+        self.speed_label.pack(side=tk.LEFT, padx=(2, 4))
+        Tooltip(speed_scale, "Animation speed: sim seconds per wall second.\nApplies live, even mid-playback.")
 
         body = ttk.Frame(self)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -271,12 +318,43 @@ class DispatcherApp(tk.Tk):
         self.status.pack(anchor=tk.W)
 
     # ------------------------------------------------------------ Model ----
+    def _on_size_change(self) -> None:
+        """Spinbox callback: regenerate at the new grid size and re-place units."""
+        try:
+            new_r = int(self.grid_rows.get())
+            new_c = int(self.grid_cols.get())
+        except tk.TclError:
+            return  # mid-typing in the spinbox; ignore.
+        if new_r == self.rows and new_c == self.cols:
+            return
+        self.regenerate_city()  # picks up the new dims internally
+        self.place_units()
+        self.dispatch()
+
     def regenerate_city(self) -> None:
         self._stop_animation()
         self.routes = []
         self._prev_cache = {}
         if hasattr(self, "play_btn"):
             self.play_btn.state(["disabled"])
+
+        # Honour any change to the Rows/Cols spinboxes. If the grid
+        # shrank, existing unit coords could be out of bounds, so wipe
+        # them and let the caller (or _on_size_change) re-place.
+        new_r = int(self.grid_rows.get())
+        new_c = int(self.grid_cols.get())
+        size_changed = (new_r != self.rows or new_c != self.cols)
+        if size_changed:
+            self.rows, self.cols = new_r, new_c
+            if hasattr(self, "canvas"):
+                self.canvas.config(
+                    width=self.cols * CELL_PX + 2 * PADDING,
+                    height=self.rows * CELL_PX + 2 * PADDING,
+                )
+            self.ambulance_coords = []
+            self.emergency_coords = []
+            self.all_emergencies = []
+
         seed = random.randint(0, 10_000)
         # Random road closures: aim for a visibly sparser network with a
         # handful of isolated pockets. ~22% of internal edges are removed.
@@ -364,11 +442,17 @@ class DispatcherApp(tk.Tk):
         )
         self._prev_cache = {cast(int, s): p for s, p in prev_by_source.items()}
 
-        # ---- Algorithm B: placeholder -----------------------------------
+        # ---- Algorithm B: run BOTH placeholders for live comparison -----
+        # Always evaluate both strategies on the same cost matrix so the
+        # side panel can display random vs greedy totals side by side.
+        random_local = random_assignment(cost)
+        greedy_local = greedy_assignment(cost)
+        self._random_total = total_cost(cost, random_local) if random_local else None
+        self._greedy_total = total_cost(cost, greedy_local) if greedy_local else None
         if self.strategy.get().startswith("greedy"):
-            assignment_local: Assignment = greedy_assignment(cost)
+            assignment_local: Assignment = greedy_local
         else:
-            assignment_local = random_assignment(cost)
+            assignment_local = random_local
 
         # Re-map column indices from the triaged sub-list back to the
         # original emergency_coords indices so the rest of the UI
@@ -392,9 +476,8 @@ class DispatcherApp(tk.Tk):
             self.play_btn.state(["disabled"])
 
     # ------------------------------------------------------- Animation ----
-    # Wall-clock seconds map to simulated travel-time units at this rate.
-    SIM_PER_WALL = 5.0
-    TICK_MS = 33
+    TICK_MS = 33  # ~30 fps
+    PULSE_MS = 600  # arrival pulse duration (wall time)
 
     def _build_routes(self, assignment: Assignment) -> List[Dict[str, Any]]:
         routes: List[Dict[str, Any]] = []
@@ -435,36 +518,77 @@ class DispatcherApp(tk.Tk):
         self._stop_animation()
         for route in self.routes:
             route["arrived"] = None
-        self._anim_start = time.perf_counter()
+        self._pulses = []
+        self._anim_sim_t = 0.0
+        self._anim_last_wall = time.perf_counter()
         self._anim_running = True
         self._tick()
 
     def _stop_animation(self) -> None:
         self._anim_running = False
+        self._pulses = []
         self.canvas.delete("moving")
 
     def _tick(self) -> None:
         if not self._anim_running:
             return
-        elapsed = (time.perf_counter() - self._anim_start) * self.SIM_PER_WALL
+        # Sim-time accumulator: integrate (wall_dt * current speed) so the
+        # user can move the Speed slider mid-animation without time jumps.
+        now = time.perf_counter()
+        dt_wall = now - self._anim_last_wall
+        self._anim_last_wall = now
+        try:
+            speed = float(self.sim_speed.get())
+        except tk.TclError:
+            speed = 5.0
+        self._anim_sim_t += dt_wall * speed
+        sim_t = self._anim_sim_t
+
         self.canvas.delete("moving")
         all_done = True
         for route in self.routes:
             total = route["total"]
-            if elapsed >= total:
+            if sim_t >= total:
                 x, y = route["pts"][-1]
                 if route["arrived"] is None:
                     route["arrived"] = total
+                    self._pulses.append({
+                        "x": x, "y": y,
+                        "color": route["color"],
+                        "start_wall": now,
+                    })
+                # Faded, smaller marker once the unit has arrived.
+                col = self._fade_color(route["color"], 0.55)
+                self.canvas.create_oval(
+                    x - 6, y - 6, x + 6, y + 6,
+                    fill=col, outline="#ffffff", width=1, tags="moving",
+                )
             else:
                 all_done = False
-                x, y = self._position_on_route(route, elapsed)
+                x, y = self._position_on_route(route, sim_t)
+                self.canvas.create_oval(
+                    x - 8, y - 8, x + 8, y + 8,
+                    fill=route["color"], outline="white", width=2,
+                    tags="moving",
+                )
+
+        # Arrival pulses: expanding outlined ring that fades over PULSE_MS.
+        still: List[Dict[str, Any]] = []
+        for p in self._pulses:
+            age_ms = (now - p["start_wall"]) * 1000.0
+            if age_ms >= self.PULSE_MS:
+                continue
+            frac = age_ms / self.PULSE_MS
+            r = 8.0 + frac * 26.0
+            lw = max(1, int(round(3 * (1 - frac))))
             self.canvas.create_oval(
-                x - 8, y - 8, x + 8, y + 8,
-                fill=route["color"], outline="white", width=2,
-                tags="moving",
+                p["x"] - r, p["y"] - r, p["x"] + r, p["y"] + r,
+                outline=p["color"], width=lw, tags="moving",
             )
+            still.append(p)
+        self._pulses = still
+
         max_total = max((r["total"] for r in self.routes), default=0.0)
-        shown = min(elapsed, max_total)
         if all_done:
             arrivals = ", ".join(
                 f"{r['label']}={r['arrived']:.2f}" for r in self.routes
@@ -472,10 +596,25 @@ class DispatcherApp(tk.Tk):
             self.status.config(
                 text=f"All units arrived at sim T = {max_total:.2f}  ({arrivals})"
             )
+        else:
+            shown = min(sim_t, max_total)
+            self.status.config(text=f"Simulated time: {shown:.2f} / {max_total:.2f}")
+
+        # Keep ticking until the last pulse has faded out too.
+        if all_done and not self._pulses:
             self._anim_running = False
             return
-        self.status.config(text=f"Simulated time: {shown:.2f} / {max_total:.2f}")
         self.after(self.TICK_MS, self._tick)
+
+    @staticmethod
+    def _fade_color(hex_color: str, factor: float) -> str:
+        """Blend `hex_color` toward white by (1 - factor). factor=1 keeps it."""
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        r = int(r + (255 - r) * (1 - factor))
+        g = int(g + (255 - g) * (1 - factor))
+        b = int(b + (255 - b) * (1 - factor))
+        return f"#{r:02x}{g:02x}{b:02x}"
 
     def _position_on_route(
         self, route: Dict[str, Any], t: float
@@ -701,6 +840,27 @@ class DispatcherApp(tk.Tk):
                 )
             total = total_cost(cost, assignment_local)
             lines.append(f"\nTotal travel time: {total:.2f}")
+
+            # ---- Side-by-side strategy comparison footer ----------------
+            rt = self._random_total
+            gt = self._greedy_total
+            if rt is not None and gt is not None:
+                lines.append("")
+                lines.append("Strategy comparison (same cost matrix):")
+                active = "greedy" if self.strategy.get().startswith("greedy") else "random"
+                r_mark = "  <-- active" if active == "random" else ""
+                g_mark = "  <-- active" if active == "greedy" else ""
+                lines.append(f"  random : {rt:7.2f}{r_mark}")
+                lines.append(f"  greedy : {gt:7.2f}{g_mark}")
+                # Only show delta if neither solution touched an UNREACHABLE cell.
+                if rt < UNREACHABLE and gt < UNREACHABLE and rt > 0:
+                    diff = rt - gt
+                    pct = diff / rt * 100
+                    if diff >= 0:
+                        lines.append(f"  greedy saves {diff:+.2f}  ({pct:+.1f}% vs random)")
+                    else:
+                        lines.append(f"  random beat greedy by {-diff:.2f}  ({-pct:.1f}%)")
+
             self._set_text(self.assignment_box, "\n".join(lines) + "\n")
         strat = self.strategy.get()
         self.status.config(
