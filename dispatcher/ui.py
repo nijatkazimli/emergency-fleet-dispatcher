@@ -1,0 +1,479 @@
+"""Cross-platform Tkinter UI for the Intelligent Emergency Fleet Dispatcher.
+
+Tkinter ships with the standard Python installer on both macOS and Windows,
+so this UI runs on either OS with zero extra dependencies.
+
+What it shows
+-------------
+* The mock city as a grid of intersections + roads.
+* Ambulances (blue squares) and emergencies (red circles).
+* The N x M cost matrix produced by Algorithm A.
+* The current assignment (drawn as coloured Dijkstra paths) and its total cost.
+
+Controls
+--------
+* Regenerate city  -- new random grid + closures.
+* Place units      -- new random ambulance / emergency positions.
+* Dispatch         -- runs Algorithm A, then the placeholder assignment
+                      (random or greedy, selectable). When Partner 2 wires
+                      `solve_assignment` in, just point the dropdown at it.
+"""
+
+from __future__ import annotations
+
+import random
+import tkinter as tk
+from tkinter import ttk
+from typing import List, Tuple, cast
+
+from routing import UNREACHABLE, build_cost_matrix, dijkstra_with_paths, reconstruct_path
+from routing.city_generator import build_grid_city, node_id
+
+from .assignment import (
+    Assignment,
+    greedy_assignment,
+    random_assignment,
+    total_cost,
+)
+from .triage import Emergency, triage
+
+Coord = Tuple[int, int]
+
+# ---- Layout constants -------------------------------------------------------
+CELL_PX = 72
+PADDING = 36
+NODE_R = 6
+UNIT_R = 14
+PATH_COLORS = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f",
+]
+
+
+class DispatcherApp(tk.Tk):
+    def __init__(self, rows: int = 8, cols: int = 8) -> None:
+        super().__init__()
+        self.title("Emergency Fleet Dispatcher — Demo")
+        self.rows = rows
+        self.cols = cols
+
+        self.n_ambulances = tk.IntVar(value=3)
+        self.n_emergencies = tk.IntVar(value=3)
+        self.strategy = tk.StringVar(value="random (placeholder)")
+
+        # Initialised by place_units(); declared up-front so the first
+        # regenerate_city() -> _redraw() call has something to draw.
+        self.ambulance_coords: List[Coord] = []
+        self.emergency_coords: List[Coord] = []
+        self.all_emergencies: List[Emergency] = []
+        self.closures: List[Tuple[Coord, Coord]] = []
+
+        self._build_widgets()
+        self.regenerate_city()
+        self.place_units()
+        self.dispatch()
+
+        # Bring the window to the foreground on launch (especially on macOS,
+        # where Tk apps otherwise open behind the active app).
+        self.after(50, self._raise_to_front)
+
+    def _raise_to_front(self) -> None:
+        try:
+            self.lift()
+            self.attributes("-topmost", True)
+            self.focus_force()
+            # Drop the always-on-top flag a moment later so the window
+            # behaves normally afterwards.
+            self.after(400, lambda: self.attributes("-topmost", False))
+        except tk.TclError:
+            pass
+
+    # ---------------------------------------------------------------- UI ----
+    def _build_widgets(self) -> None:
+        top = ttk.Frame(self, padding=8)
+        top.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Button(top, text="Regenerate city", command=self.regenerate_city).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Place units", command=self.place_units).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Dispatch", command=self.dispatch).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(top, text="  Ambulances:").pack(side=tk.LEFT)
+        ttk.Spinbox(top, from_=1, to=8, width=3, textvariable=self.n_ambulances).pack(side=tk.LEFT)
+        ttk.Label(top, text="  Emergencies:").pack(side=tk.LEFT)
+        ttk.Spinbox(top, from_=1, to=8, width=3, textvariable=self.n_emergencies).pack(side=tk.LEFT)
+
+        ttk.Label(top, text="  Strategy:").pack(side=tk.LEFT)
+        ttk.Combobox(
+            top,
+            textvariable=self.strategy,
+            values=["random (placeholder)", "greedy (baseline)"],
+            state="readonly",
+            width=22,
+        ).pack(side=tk.LEFT)
+
+        body = ttk.Frame(self)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        canvas_w = self.cols * CELL_PX + 2 * PADDING
+        canvas_h = self.rows * CELL_PX + 2 * PADDING
+        self.canvas = tk.Canvas(body, width=canvas_w, height=canvas_h, bg="white")
+        self.canvas.pack(side=tk.LEFT, padx=8, pady=8)
+
+        side = ttk.Frame(body, padding=8)
+        side.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Helper to spawn a read-only, theme-independent Text widget.
+        def make_text(height: int) -> tk.Text:
+            return tk.Text(
+                side,
+                height=height,
+                width=46,
+                font=("Menlo", 11),
+                state="disabled",
+                cursor="arrow",
+                background="#f7f7f7",
+                foreground="#111111",
+                insertbackground="#111111",
+                relief=tk.FLAT,
+                borderwidth=1,
+                highlightthickness=0,
+            )
+
+        ttk.Label(side, text="Cost matrix (rows = ambulances, cols = emergencies)").pack(anchor=tk.W)
+        self.matrix_box = make_text(14)
+        self.matrix_box.pack(fill=tk.BOTH, expand=False, pady=(2, 8))
+
+        ttk.Label(side, text="Assignment").pack(anchor=tk.W)
+        self.assignment_box = make_text(10)
+        self.assignment_box.pack(fill=tk.BOTH, expand=True, pady=(2, 8))
+
+        ttk.Label(side, text="Queued (N > M overflow)").pack(anchor=tk.W)
+        self.queue_box = make_text(5)
+        self.queue_box.pack(fill=tk.BOTH, expand=False, pady=(2, 8))
+
+        # ttk.Label uses the OS-native foreground colour, so we don't force
+        # one (the previous "#444" was unreadable on dark themes).
+        self.legend = ttk.Label(side, text="")
+        self.legend.pack(anchor=tk.W, pady=(4, 0))
+
+        self.status = ttk.Label(side, text="")
+        self.status.pack(anchor=tk.W)
+
+    # ------------------------------------------------------------ Model ----
+    def regenerate_city(self) -> None:
+        seed = random.randint(0, 10_000)
+        # Random road closures: aim for a visibly sparser network with a
+        # handful of isolated pockets. ~22% of internal edges are removed.
+        closures: List[Tuple[Coord, Coord]] = []
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if c + 1 < self.cols and random.random() < 0.22:
+                    closures.append(((r, c), (r, c + 1)))
+                if r + 1 < self.rows and random.random() < 0.22:
+                    closures.append(((r, c), (r + 1, c)))
+        self.closures = closures
+        self.city = build_grid_city(self.rows, self.cols, closed_edges=closures, seed=seed)
+
+        # Pre-compute min/max edge weight for legend + colour scaling.
+        weights: List[float] = []
+        for u in self.city.nodes():
+            for _v, w in self.city.neighbors(u):
+                weights.append(w)
+        self.w_min = min(weights) if weights else 1.0
+        self.w_max = max(weights) if weights else 1.0
+        self.legend.config(
+            text=f"Road colour = travel time (light = {self.w_min:.2f}, "
+                 f"dark red = {self.w_max:.2f}). Dashed = closed."
+        )
+        self._redraw()
+
+    def place_units(self) -> None:
+        all_cells = [(r, c) for r in range(self.rows) for c in range(self.cols)]
+        random.shuffle(all_cells)
+        n_amb = self.n_ambulances.get()
+        n_eme = self.n_emergencies.get()
+        self.ambulance_coords = all_cells[:n_amb]
+        eme_coords = all_cells[n_amb:n_amb + n_eme]
+        # Assign each emergency a random priority 1..5 (5 = most urgent)
+        # and a monotonically increasing call_id for FIFO tie-breaking.
+        self.all_emergencies: List[Emergency] = [
+            Emergency(coord=c, priority=random.randint(1, 5), call_id=k)
+            for k, c in enumerate(eme_coords)
+        ]
+        # `emergency_coords` is what the canvas/drawing path uses; the
+        # triage step in dispatch() decides which subset is active.
+        self.emergency_coords = eme_coords
+        self._redraw()
+        self._set_text(self.assignment_box, "")
+        self._set_text(self.matrix_box, "")
+        self._set_text(self.queue_box, "")
+        self.status.config(text="Units placed. Click Dispatch.")
+
+    def dispatch(self) -> None:
+        amb_nodes = [node_id(c, self.cols) for c in self.ambulance_coords]
+
+        # ---- Triage (pre-processing): fleet-shortage handling -----------
+        capacity = len(amb_nodes)
+        dispatched, queued = triage(self.all_emergencies, capacity)
+
+        # Map the surviving emergencies back to indices into the original
+        # emergency_coords list so the UI labels (E0, E1, ...) stay stable.
+        coord_to_index = {e.coord: i for i, e in enumerate(self.all_emergencies)}
+        dispatched_indices = [coord_to_index[e.coord] for e in dispatched]
+        eme_nodes = [node_id(self.emergency_coords[i], self.cols)
+                     for i in dispatched_indices]
+
+        # ---- Algorithm A: cost matrix -----------------------------------
+        cost = build_cost_matrix(self.city, amb_nodes, eme_nodes)
+
+        # ---- Algorithm B: placeholder -----------------------------------
+        if self.strategy.get().startswith("greedy"):
+            assignment_local: Assignment = greedy_assignment(cost)
+        else:
+            assignment_local = random_assignment(cost)
+
+        # Re-map column indices from the triaged sub-list back to the
+        # original emergency_coords indices so the rest of the UI
+        # (drawing, badges, assignment text) keeps using E0/E1/... ids.
+        assignment: Assignment = [
+            (i, dispatched_indices[j]) for i, j in assignment_local
+        ]
+
+        self._show_matrix(cost, dispatched_indices)
+        self._show_assignment(cost, assignment_local, dispatched_indices)
+        self._show_queue(queued)
+        self._redraw(cost=cost, assignment=assignment)
+
+    # ------------------------------------------------------------- Draw ----
+    def _redraw(
+        self,
+        cost: List[List[float]] | None = None,
+        assignment: Assignment | None = None,
+    ) -> None:
+        c = self.canvas
+        c.delete("all")
+
+        # ---- Roads (pass 1: lines) -------------------------------------
+        # Collect open-edge midpoints so we can draw labels in a second
+        # pass that sits on top of every line.
+        label_jobs: List[Tuple[float, float, float]] = []
+        for r in range(self.rows):
+            for cc in range(self.cols):
+                here = (r, cc)
+                for nb in ((r, cc + 1), (r + 1, cc)):
+                    nr, nc = nb
+                    if nr >= self.rows or nc >= self.cols:
+                        continue
+                    x1, y1 = self._xy(here)
+                    x2, y2 = self._xy(nb)
+                    closed = (here, nb) in self.closures or (nb, here) in self.closures
+                    if closed:
+                        c.create_line(x1, y1, x2, y2, fill="#cccccc", dash=(2, 4))
+                        continue
+                    w = self._edge_weight(node_id(here, self.cols),
+                                          node_id(nb, self.cols))
+                    if w is None:
+                        continue
+                    color, width = self._weight_style(w)
+                    c.create_line(x1, y1, x2, y2, fill=color, width=width)
+                    label_jobs.append(((x1 + x2) / 2, (y1 + y2) / 2, w))
+
+        # ---- Roads (pass 2: weight labels on top) ----------------------
+        for mx, my, w in label_jobs:
+            text = f"{w:.1f}"
+            # White background pill so the number is legible across any road colour.
+            pad_x, pad_y = 10, 7
+            c.create_rectangle(
+                mx - pad_x, my - pad_y, mx + pad_x, my + pad_y,
+                fill="#ffffff", outline="",
+            )
+            c.create_text(
+                mx, my, text=text,
+                fill="#222222", font=("Helvetica", 10, "bold"),
+            )
+
+        # Intersections
+        for r in range(self.rows):
+            for cc in range(self.cols):
+                x, y = self._xy((r, cc))
+                c.create_oval(x - NODE_R, y - NODE_R, x + NODE_R, y + NODE_R,
+                              fill="#eeeeee", outline="#888")
+
+        # ---- Unit base shapes (drawn UNDER ribbons so a route that
+        #      transits a unit's cell isn't hidden by the marker). The
+        #      identifying badge + label is re-drawn on top further down.
+        for coord in self.ambulance_coords:
+            x, y = self._xy(coord)
+            c.create_rectangle(x - UNIT_R, y - UNIT_R, x + UNIT_R, y + UNIT_R,
+                               fill="#1f77b4", outline="black")
+        for coord in self.emergency_coords:
+            x, y = self._xy(coord)
+            c.create_oval(x - UNIT_R, y - UNIT_R, x + UNIT_R, y + UNIT_R,
+                          fill="#d62728", outline="black")
+
+        # Assignment paths -- draw each route as a ribbon offset
+        # perpendicular to its segments, so overlapping routes appear as
+        # parallel ribbons instead of hiding each other.
+        if assignment is not None:
+            K = len(assignment)
+            spacing = 6  # pixels between parallel ribbons
+            ribbon_w = 3
+            for k, (i, j) in enumerate(assignment):
+                color = PATH_COLORS[k % len(PATH_COLORS)]
+                # Symmetric offset around 0: e.g. K=3 -> [-1, 0, +1] * spacing.
+                offset = (k - (K - 1) / 2.0) * spacing
+
+                src = node_id(self.ambulance_coords[i], self.cols)
+                dst = node_id(self.emergency_coords[j], self.cols)
+                _, prev = dijkstra_with_paths(self.city, src)
+                path_nodes = reconstruct_path(prev, dst)
+                if len(path_nodes) < 2:
+                    continue
+
+                # Convert node ids back to canvas coordinates.
+                xy: List[Tuple[float, float]] = []
+                for n in path_nodes:
+                    pr, pc = divmod(cast(int, n), self.cols)
+                    xy.append(self._xy((pr, pc)))
+
+                # Draw segment-by-segment with a per-segment perpendicular
+                # offset so the route hugs the road but shifts sideways.
+                for (x1, y1), (x2, y2) in zip(xy, xy[1:]):
+                    dx, dy = x2 - x1, y2 - y1
+                    length = (dx * dx + dy * dy) ** 0.5 or 1.0
+                    # Perpendicular unit vector (rotate 90 deg).
+                    nx, ny = -dy / length, dx / length
+                    ox, oy = nx * offset, ny * offset
+                    c.create_line(
+                        x1 + ox, y1 + oy, x2 + ox, y2 + oy,
+                        fill=color, width=ribbon_w,
+                        capstyle=tk.ROUND,
+                    )
+
+        # ---- Unit identity badges (small disk + label) drawn ON TOP of
+        #      ribbons so each ambulance / emergency stays identifiable
+        #      even when routes pass through its cell.
+        badge_r = 9
+        for i, coord in enumerate(self.ambulance_coords):
+            x, y = self._xy(coord)
+            c.create_oval(x - badge_r, y - badge_r, x + badge_r, y + badge_r,
+                          fill="#1f77b4", outline="white", width=2)
+            c.create_text(x, y, text=f"A{i}", fill="white",
+                          font=("Helvetica", 10, "bold"))
+        for j, coord in enumerate(self.emergency_coords):
+            x, y = self._xy(coord)
+            c.create_oval(x - badge_r, y - badge_r, x + badge_r, y + badge_r,
+                          fill="#d62728", outline="white", width=2)
+            c.create_text(x, y, text=f"E{j}", fill="white",
+                          font=("Helvetica", 10, "bold"))
+            # Tiny priority chip above the badge (P5 = most urgent).
+            if j < len(self.all_emergencies):
+                pri = self.all_emergencies[j].priority
+                c.create_text(x, y - badge_r - 9,
+                              text=f"P{pri}", fill="#a02020",
+                              font=("Helvetica", 9, "bold"))
+
+    def _xy(self, coord: Coord) -> Tuple[float, float]:
+        r, c = coord
+        return PADDING + c * CELL_PX, PADDING + r * CELL_PX
+
+    def _edge_weight(self, u: int, v: int) -> float | None:
+        for nb, w in self.city.neighbors(u):
+            if nb == v:
+                return w
+        return None
+
+    def _weight_style(self, w: float) -> Tuple[str, int]:
+        """Map an edge weight to (hex colour, line width).
+
+        Light grey = fastest road; dark red = slowest road.
+        """
+        span = self.w_max - self.w_min
+        t = 0.0 if span <= 1e-9 else (w - self.w_min) / span
+        r1, g1, b1 = 0xD9, 0xD9, 0xD9   # fast
+        r2, g2, b2 = 0x8B, 0x10, 0x10   # slow
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        width = 1 + int(round(2 * t))
+        return f"#{r:02x}{g:02x}{b:02x}", width
+
+    def _set_text(self, widget: tk.Text, content: str) -> None:
+        """Write into a read-only Text widget."""
+        widget.config(state="normal")
+        widget.delete("1.0", tk.END)
+        if content:
+            widget.insert(tk.END, content)
+        widget.config(state="disabled")
+
+    # --------------------------------------------------------- Side panel ----
+    def _show_matrix(
+        self,
+        cost: List[List[float]],
+        dispatched_indices: List[int],
+    ) -> None:
+        if not cost or not cost[0]:
+            self._set_text(self.matrix_box, "(no dispatchable emergencies)")
+            return
+        # Column header uses the *original* emergency ids (E0/E1/...) so
+        # the user can match it against the canvas badges.
+        header = "       " + " ".join(f"E{dispatched_indices[j]:>2}   "
+                                      for j in range(len(cost[0])))
+        lines = [header]
+        for i, row in enumerate(cost):
+            cells = " ".join(
+                "  INF  " if v >= UNREACHABLE else f"{v:6.2f} " for v in row
+            )
+            lines.append(f"A{i:>2}  {cells}")
+        self._set_text(self.matrix_box, "\n".join(lines) + "\n")
+
+    def _show_assignment(
+        self,
+        cost: List[List[float]],
+        assignment_local: Assignment,
+        dispatched_indices: List[int],
+    ) -> None:
+        if not assignment_local:
+            self._set_text(self.assignment_box, "(no assignment)")
+        else:
+            lines = []
+            for i, j in assignment_local:
+                v = cost[i][j]
+                marker = "  [UNREACHABLE]" if v >= UNREACHABLE else ""
+                eid = dispatched_indices[j]
+                lines.append(
+                    f"Ambulance A{i} -> Emergency E{eid}   cost = {v:6.2f}{marker}"
+                )
+            total = total_cost(cost, assignment_local)
+            lines.append(f"\nTotal travel time: {total:.2f}")
+            self._set_text(self.assignment_box, "\n".join(lines) + "\n")
+        strat = self.strategy.get()
+        self.status.config(
+            text=f"Strategy: {strat}. TODO: replace with Hungarian (Algorithm B) "
+                 "via dispatcher.assignment.solve_assignment()."
+        )
+
+    def _show_queue(self, queued: List[Emergency]) -> None:
+        if not queued:
+            self._set_text(self.queue_box, "(none — fleet covers all calls)")
+            return
+        lines = [f"{len(queued)} call(s) deferred to next cycle:"]
+        for e in queued:
+            # Look up the original E-id so it matches the canvas badges.
+            try:
+                eid = next(
+                    i for i, c in enumerate(self.emergency_coords) if c == e.coord
+                )
+                label = f"E{eid}"
+            except StopIteration:
+                label = "?"
+            lines.append(f"  {label}  priority={e.priority}  call_id={e.call_id}")
+        self._set_text(self.queue_box, "\n".join(lines) + "\n")
+
+
+def main() -> None:
+    DispatcherApp().mainloop()
+
+
+if __name__ == "__main__":
+    main()
