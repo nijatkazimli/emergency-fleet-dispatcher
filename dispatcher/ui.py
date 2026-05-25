@@ -22,9 +22,10 @@ Controls
 from __future__ import annotations
 
 import random
+import time
 import tkinter as tk
 from tkinter import ttk
-from typing import List, Tuple, cast
+from typing import Any, Dict, List, Tuple, cast
 
 from routing import UNREACHABLE, build_cost_matrix, dijkstra_with_paths, reconstruct_path
 from routing.city_generator import build_grid_city, node_id
@@ -50,6 +51,74 @@ PATH_COLORS = [
 ]
 
 
+class Tooltip:
+    """Lightweight hover tooltip for any Tk widget (stdlib only)."""
+
+    def __init__(self, widget: tk.Widget, text: "str | Any", delay_ms: int = 450) -> None:
+        self.widget = widget
+        self.text = text  # str or zero-arg callable returning str
+        self.delay_ms = delay_ms
+        self._after_id: str | None = None
+        self._tip: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._on_enter, add="+")
+        widget.bind("<Leave>", self._on_leave, add="+")
+        widget.bind("<ButtonPress>", self._on_leave, add="+")
+
+    def _on_enter(self, _evt: Any) -> None:
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _on_leave(self, _evt: Any) -> None:
+        self._cancel()
+        self._hide()
+
+    def _cancel(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+
+    def _show(self) -> None:
+        if self._tip is not None:
+            return
+        msg = self.text() if callable(self.text) else self.text
+        if not msg:
+            return
+        msg = str(msg)
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x}+{y}")
+        try:
+            tip.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tk.Label(
+            tip,
+            text=msg,
+            background="#fffbcc",
+            foreground="#111111",
+            relief=tk.SOLID,
+            borderwidth=1,
+            padx=6,
+            pady=3,
+            font=("TkDefaultFont", 9),
+            justify=tk.LEFT,
+        ).pack()
+        self._tip = tip
+
+    def _hide(self) -> None:
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+
+
 class DispatcherApp(tk.Tk):
     def __init__(self, rows: int = 8, cols: int = 8) -> None:
         super().__init__()
@@ -67,6 +136,11 @@ class DispatcherApp(tk.Tk):
         self.emergency_coords: List[Coord] = []
         self.all_emergencies: List[Emergency] = []
         self.closures: List[Tuple[Coord, Coord]] = []
+
+        # Animation state (populated by dispatch(), driven by play_animation()).
+        self.routes: List[Dict[str, Any]] = []
+        self._anim_running: bool = False
+        self._anim_start: float = 0.0
 
         self._build_widgets()
         self.regenerate_city()
@@ -93,23 +167,50 @@ class DispatcherApp(tk.Tk):
         top = ttk.Frame(self, padding=8)
         top.pack(side=tk.TOP, fill=tk.X)
 
-        ttk.Button(top, text="Regenerate city", command=self.regenerate_city).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="Place units", command=self.place_units).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="Dispatch", command=self.dispatch).pack(side=tk.LEFT, padx=4)
+        regen_btn = ttk.Button(top, text="Regenerate city", command=self.regenerate_city)
+        regen_btn.pack(side=tk.LEFT, padx=4)
+        Tooltip(regen_btn, "Rebuild the road network with new random weights and closures.")
+
+        place_btn = ttk.Button(top, text="Place units", command=self.place_units)
+        place_btn.pack(side=tk.LEFT, padx=4)
+        Tooltip(place_btn, "Randomly position ambulances and emergencies on the grid.")
+
+        dispatch_btn = ttk.Button(top, text="Dispatch", command=self.dispatch)
+        dispatch_btn.pack(side=tk.LEFT, padx=4)
+        Tooltip(dispatch_btn, "Run triage, build the cost matrix, and assign ambulances to emergencies.")
+
+        self.play_btn = ttk.Button(top, text="Play \u25B6", command=self.play_animation)
+        self.play_btn.pack(side=tk.LEFT, padx=4)
+        self.play_btn.state(["disabled"])
+        Tooltip(
+            self.play_btn,
+            lambda: (
+                "Animate ambulances along their assigned routes."
+                if "disabled" not in self.play_btn.state()
+                else "Disabled \u2014 click Dispatch first to assign routes."
+            ),
+        )
 
         ttk.Label(top, text="  Ambulances:").pack(side=tk.LEFT)
-        ttk.Spinbox(top, from_=1, to=8, width=3, textvariable=self.n_ambulances).pack(side=tk.LEFT)
+        amb_spin = ttk.Spinbox(top, from_=1, to=8, width=3, textvariable=self.n_ambulances)
+        amb_spin.pack(side=tk.LEFT)
+        Tooltip(amb_spin, "Number of ambulances. Takes effect on the next Place units.")
+
         ttk.Label(top, text="  Emergencies:").pack(side=tk.LEFT)
-        ttk.Spinbox(top, from_=1, to=8, width=3, textvariable=self.n_emergencies).pack(side=tk.LEFT)
+        emg_spin = ttk.Spinbox(top, from_=1, to=8, width=3, textvariable=self.n_emergencies)
+        emg_spin.pack(side=tk.LEFT)
+        Tooltip(emg_spin, "Number of emergency calls. If it exceeds ambulances, triage queues the rest.")
 
         ttk.Label(top, text="  Strategy:").pack(side=tk.LEFT)
-        ttk.Combobox(
+        strat_box = ttk.Combobox(
             top,
             textvariable=self.strategy,
             values=["random (placeholder)", "greedy (baseline)"],
             state="readonly",
             width=22,
-        ).pack(side=tk.LEFT)
+        )
+        strat_box.pack(side=tk.LEFT)
+        Tooltip(strat_box, "Assignment policy. Swap for the partner's Hungarian solver when ready.")
 
         body = ttk.Frame(self)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -161,6 +262,10 @@ class DispatcherApp(tk.Tk):
 
     # ------------------------------------------------------------ Model ----
     def regenerate_city(self) -> None:
+        self._stop_animation()
+        self.routes = []
+        if hasattr(self, "play_btn"):
+            self.play_btn.state(["disabled"])
         seed = random.randint(0, 10_000)
         # Random road closures: aim for a visibly sparser network with a
         # handful of isolated pockets. ~22% of internal edges are removed.
@@ -188,6 +293,9 @@ class DispatcherApp(tk.Tk):
         self._redraw()
 
     def place_units(self) -> None:
+        self._stop_animation()
+        self.routes = []
+        self.play_btn.state(["disabled"])
         all_cells = [(r, c) for r in range(self.rows) for c in range(self.cols)]
         random.shuffle(all_cells)
         n_amb = self.n_ambulances.get()
@@ -243,6 +351,113 @@ class DispatcherApp(tk.Tk):
         self._show_assignment(cost, assignment_local, dispatched_indices)
         self._show_queue(queued)
         self._redraw(cost=cost, assignment=assignment)
+
+        # Build the per-route polylines + per-segment durations so the
+        # Play button can animate ambulances along them.
+        self._stop_animation()
+        self.routes = self._build_routes(assignment)
+        if self.routes:
+            self.play_btn.state(["!disabled"])
+        else:
+            self.play_btn.state(["disabled"])
+
+    # ------------------------------------------------------- Animation ----
+    # Wall-clock seconds map to simulated travel-time units at this rate.
+    SIM_PER_WALL = 5.0
+    TICK_MS = 33
+
+    def _build_routes(self, assignment: Assignment) -> List[Dict[str, Any]]:
+        routes: List[Dict[str, Any]] = []
+        for k, (i, j) in enumerate(assignment):
+            color = PATH_COLORS[k % len(PATH_COLORS)]
+            src = node_id(self.ambulance_coords[i], self.cols)
+            dst = node_id(self.emergency_coords[j], self.cols)
+            _, prev = dijkstra_with_paths(self.city, src)
+            path_nodes = reconstruct_path(prev, dst)
+            if len(path_nodes) < 2:
+                continue
+            pts: List[Tuple[float, float]] = []
+            durs: List[float] = []
+            prev_n: int | None = None
+            for n in path_nodes:
+                n_i = cast(int, n)
+                pr, pc = divmod(n_i, self.cols)
+                pts.append(self._xy((pr, pc)))
+                if prev_n is not None:
+                    w = self._edge_weight(prev_n, n_i) or 1.0
+                    durs.append(w)
+                prev_n = n_i
+            routes.append({
+                "label": f"A{i}\u2192E{j}",
+                "color": color,
+                "pts": pts,
+                "durs": durs,
+                "total": sum(durs),
+                "arrived": None,  # filled in when the unit reaches its target
+            })
+        return routes
+
+    def play_animation(self) -> None:
+        if not self.routes:
+            return
+        self._stop_animation()
+        for route in self.routes:
+            route["arrived"] = None
+        self._anim_start = time.perf_counter()
+        self._anim_running = True
+        self._tick()
+
+    def _stop_animation(self) -> None:
+        self._anim_running = False
+        self.canvas.delete("moving")
+
+    def _tick(self) -> None:
+        if not self._anim_running:
+            return
+        elapsed = (time.perf_counter() - self._anim_start) * self.SIM_PER_WALL
+        self.canvas.delete("moving")
+        all_done = True
+        for route in self.routes:
+            total = route["total"]
+            if elapsed >= total:
+                x, y = route["pts"][-1]
+                if route["arrived"] is None:
+                    route["arrived"] = total
+            else:
+                all_done = False
+                x, y = self._position_on_route(route, elapsed)
+            self.canvas.create_oval(
+                x - 8, y - 8, x + 8, y + 8,
+                fill=route["color"], outline="white", width=2,
+                tags="moving",
+            )
+        max_total = max((r["total"] for r in self.routes), default=0.0)
+        shown = min(elapsed, max_total)
+        if all_done:
+            arrivals = ", ".join(
+                f"{r['label']}={r['arrived']:.2f}" for r in self.routes
+            )
+            self.status.config(
+                text=f"All units arrived at sim T = {max_total:.2f}  ({arrivals})"
+            )
+            self._anim_running = False
+            return
+        self.status.config(text=f"Simulated time: {shown:.2f} / {max_total:.2f}")
+        self.after(self.TICK_MS, self._tick)
+
+    def _position_on_route(
+        self, route: Dict[str, Any], t: float
+    ) -> Tuple[float, float]:
+        """Linear interpolation along the route's polyline at sim-time `t`."""
+        acc = 0.0
+        for i, d in enumerate(route["durs"]):
+            if t < acc + d:
+                frac = 0.0 if d <= 0 else (t - acc) / d
+                x1, y1 = route["pts"][i]
+                x2, y2 = route["pts"][i + 1]
+                return (x1 + (x2 - x1) * frac, y1 + (y2 - y1) * frac)
+            acc += d
+        return route["pts"][-1]
 
     # ------------------------------------------------------------- Draw ----
     def _redraw(
