@@ -34,6 +34,7 @@ from .assignment import (
     Assignment,
     greedy_assignment,
     random_assignment,
+    solve_assignment,
     total_cost,
 )
 from .triage import Emergency, triage
@@ -251,7 +252,7 @@ class DispatcherApp(tk.Tk):
         strat_box = ttk.Combobox(
             top,
             textvariable=self.strategy,
-            values=["random (placeholder)", "greedy (baseline)"],
+            values=["random (placeholder)", "greedy (baseline)", "hungarian (optimal)"],
             state="readonly",
             width=22,
         )
@@ -449,8 +450,10 @@ class DispatcherApp(tk.Tk):
         greedy_local = greedy_assignment(cost)
         self._random_total = total_cost(cost, random_local) if random_local else None
         self._greedy_total = total_cost(cost, greedy_local) if greedy_local else None
-        if self.strategy.get().startswith("greedy"):
-            assignment_local: Assignment = greedy_local
+        if self.strategy.get().startswith("hungarian"):
+            assignment_local: Assignment = solve_assignment(cost)
+        elif self.strategy.get().startswith("greedy"):
+            assignment_local = greedy_local
         else:
             assignment_local = random_local
 

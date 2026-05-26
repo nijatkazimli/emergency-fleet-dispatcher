@@ -114,9 +114,5 @@ def total_cost(cost_matrix: List[List[float]], assignment: Assignment) -> float:
     return sum(cost_matrix[i][j] for i, j in assignment)
 
 
-# ---------------------------------------------------------------------------
-# Real Algorithm B will live here once Partner 2 lands it:
-#
-# def solve_assignment(cost_matrix: list[list[float]]) -> Assignment:
-#     ...  # Hungarian / Kuhn-Munkres, O(max(N, M)^3)
-# ---------------------------------------------------------------------------
+# Import and re-export the Hungarian solver from the hungarian module
+from .hungarian import solve_assignment  # noqa: E402, F401
