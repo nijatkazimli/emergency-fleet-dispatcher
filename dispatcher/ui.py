@@ -14,9 +14,8 @@ Controls
 --------
 * Regenerate city  -- new random grid + closures.
 * Place units      -- new random ambulance / emergency positions.
-* Dispatch         -- runs Algorithm A, then the placeholder assignment
-                      (random or greedy, selectable). When Partner 2 wires
-                      `solve_assignment` in, just point the dropdown at it.
+* Dispatch         -- runs Algorithm A (cost matrix) then Algorithm B
+                      (random / greedy / hungarian, selectable).
 """
 
 from __future__ import annotations
@@ -162,6 +161,7 @@ class DispatcherApp(tk.Tk):
         # footer. Filled in by dispatch().
         self._random_total: float | None = None
         self._greedy_total: float | None = None
+        self._hungarian_total: float | None = None
 
         # Per-dispatch Dijkstra cache: ambulance node -> prev-map. Filled
         # by dispatch() (one Dijkstra per ambulance, with early
@@ -257,7 +257,7 @@ class DispatcherApp(tk.Tk):
             width=22,
         )
         strat_box.pack(side=tk.LEFT)
-        Tooltip(strat_box, "Assignment policy. Swap for the partner's Hungarian solver when ready.")
+        Tooltip(strat_box, "Assignment policy: random / greedy baselines vs the Hungarian optimal solver.")
 
         ttk.Label(top, text="  Speed:").pack(side=tk.LEFT)
         self.speed_label = ttk.Label(top, text="5.0x", width=5)
@@ -443,15 +443,19 @@ class DispatcherApp(tk.Tk):
         )
         self._prev_cache = {cast(int, s): p for s, p in prev_by_source.items()}
 
-        # ---- Algorithm B: run BOTH placeholders for live comparison -----
-        # Always evaluate both strategies on the same cost matrix so the
-        # side panel can display random vs greedy totals side by side.
+        # ---- Algorithm B: run ALL three strategies for live comparison --
+        # Always evaluate every strategy on the same cost matrix so the
+        # side panel can display random / greedy / hungarian totals.
         random_local = random_assignment(cost)
         greedy_local = greedy_assignment(cost)
+        hungarian_local = solve_assignment(cost)
         self._random_total = total_cost(cost, random_local) if random_local else None
         self._greedy_total = total_cost(cost, greedy_local) if greedy_local else None
+        self._hungarian_total = (
+            total_cost(cost, hungarian_local) if hungarian_local else None
+        )
         if self.strategy.get().startswith("hungarian"):
-            assignment_local: Assignment = solve_assignment(cost)
+            assignment_local: Assignment = hungarian_local
         elif self.strategy.get().startswith("greedy"):
             assignment_local = greedy_local
         else:
@@ -847,29 +851,46 @@ class DispatcherApp(tk.Tk):
             # ---- Side-by-side strategy comparison footer ----------------
             rt = self._random_total
             gt = self._greedy_total
-            if rt is not None and gt is not None:
+            ht = self._hungarian_total
+            if rt is not None and gt is not None and ht is not None:
                 lines.append("")
                 lines.append("Strategy comparison (same cost matrix):")
-                active = "greedy" if self.strategy.get().startswith("greedy") else "random"
+                strat_now = self.strategy.get()
+                if strat_now.startswith("hungarian"):
+                    active = "hungarian"
+                elif strat_now.startswith("greedy"):
+                    active = "greedy"
+                else:
+                    active = "random"
                 r_mark = "  <-- active" if active == "random" else ""
                 g_mark = "  <-- active" if active == "greedy" else ""
-                lines.append(f"  random : {rt:7.2f}{r_mark}")
-                lines.append(f"  greedy : {gt:7.2f}{g_mark}")
-                # Only show delta if neither solution touched an UNREACHABLE cell.
-                if rt < UNREACHABLE and gt < UNREACHABLE and rt > 0:
-                    diff = rt - gt
-                    pct = diff / rt * 100
-                    if diff >= 0:
-                        lines.append(f"  greedy saves {diff:+.2f}  ({pct:+.1f}% vs random)")
-                    else:
-                        lines.append(f"  random beat greedy by {-diff:.2f}  ({-pct:.1f}%)")
+                h_mark = "  <-- active" if active == "hungarian" else ""
+                lines.append(f"  random    : {rt:7.2f}{r_mark}")
+                lines.append(f"  greedy    : {gt:7.2f}{g_mark}")
+                lines.append(f"  hungarian : {ht:7.2f}{h_mark}")
+                # Only show deltas if no solution touched an UNREACHABLE cell.
+                if (rt < UNREACHABLE and gt < UNREACHABLE
+                        and ht < UNREACHABLE and rt > 0):
+                    saved_vs_random = rt - ht
+                    saved_vs_greedy = gt - ht
+                    pct_r = saved_vs_random / rt * 100 if rt > 0 else 0.0
+                    lines.append(
+                        f"  hungarian saves {saved_vs_random:+.2f} vs random  "
+                        f"({pct_r:+.1f}%)"
+                    )
+                    if gt > 0:
+                        pct_g = saved_vs_greedy / gt * 100
+                        if saved_vs_greedy > 1e-9:
+                            lines.append(
+                                f"  hungarian saves {saved_vs_greedy:+.2f} vs greedy  "
+                                f"({pct_g:+.1f}%)"
+                            )
+                        else:
+                            lines.append("  hungarian ties greedy on this matrix")
 
             self._set_text(self.assignment_box, "\n".join(lines) + "\n")
         strat = self.strategy.get()
-        self.status.config(
-            text=f"Strategy: {strat}. TODO: replace with Hungarian (Algorithm B) "
-                 "via dispatcher.assignment.solve_assignment()."
-        )
+        self.status.config(text=f"Strategy: {strat}.")
 
     def _show_queue(self, queued: List[Emergency]) -> None:
         if not queued:
