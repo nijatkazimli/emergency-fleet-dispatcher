@@ -1,49 +1,18 @@
-"""Assignment layer — placeholder for Algorithm B (Hungarian / Kuhn-Munkres).
+"""Assignment layer for the dispatcher.
 
-==============================================================================
-TODO (Partner 2): replace `random_assignment` with the real Hungarian solver.
-==============================================================================
+Re-exports Algorithm B (`hungarian.solve_assignment`) under the stable
+`dispatcher.assignment` namespace the UI imports from, alongside two
+baselines (`random_assignment`, `greedy_assignment`) used by the live
+strategy-comparison panel.
 
-Required signature
-------------------
-    def solve_assignment(cost_matrix: list[list[float]]) -> list[tuple[int, int]]:
+Contract of `solve_assignment(cost_matrix)` (delivered by the `hungarian`
+package):
 
-Input
------
-    cost_matrix : list[list[float]]
-        Produced by `routing.build_cost_matrix(...)`.
-        Shape: N x M, where
-            N = number of ambulances (rows)
-            M = number of emergencies (columns)
-        Every cell is a finite, non-negative float.
-        Unreachable pairs are filled with `routing.UNREACHABLE` (= 1e9),
-        NOT with `math.inf`, so the solver can stay purely numeric.
-
-Output
-------
-    assignments : list[tuple[int, int]]
-        A 1:1 bipartite matching that minimizes the total travel time.
-        Each tuple is (ambulance_row_index, emergency_col_index).
-        len(assignments) == min(N, M).
-        Indices must be valid into the original input lists, so the caller
-        can map them back to ambulance / emergency identities.
-
-Contract guarantees the caller relies on
-----------------------------------------
-    * Sum of `cost_matrix[i][j]` over the returned pairs is the global minimum.
-    * No row index and no column index is repeated.
-    * If a pairing is forced onto an UNREACHABLE cell (because N > number of
-      reachable emergencies), that's fine — the caller can detect it by
-      checking the cell value against `routing.UNREACHABLE`.
-
-Tie-breaking
-------------
-    When several optimal matchings exist, any one of them is acceptable.
-
-Until Algorithm B is wired in, the UI calls `random_assignment` so the
-demo flow still runs end-to-end. A "Greedy" baseline is also provided so
-the presentation can contrast the (eventual) Hungarian result against a
-naive dispatcher.
+    Input  : N x M list[list[float]] of finite non-negative travel times.
+             Unreachable pairs are filled with `routing.UNREACHABLE` (= 1e9),
+             never `math.inf`.
+    Output : list[tuple[int, int]] of length `min(N, M)` whose selected
+             cells sum to the global minimum, with no duplicate rows or cols.
 """
 
 from __future__ import annotations
@@ -58,9 +27,8 @@ def random_assignment(
     cost_matrix: List[List[float]],
     seed: int | None = None,
 ) -> Assignment:
-    """Placeholder: returns a random valid 1:1 matching.
-
-    Replace with `solve_assignment` (Hungarian) once Partner 2 ships it.
+    """Random valid 1:1 matching. Used as the worst-case baseline in the
+    UI's strategy-comparison panel.
     """
     if not cost_matrix or not cost_matrix[0]:
         return []
@@ -114,5 +82,7 @@ def total_cost(cost_matrix: List[List[float]], assignment: Assignment) -> float:
     return sum(cost_matrix[i][j] for i, j in assignment)
 
 
-# Import and re-export the Hungarian solver from the hungarian module
-from .hungarian import solve_assignment  # noqa: E402, F401
+# Re-export the Hungarian solver from the top-level `hungarian` package
+# (Algorithm B). Keeps the existing `dispatcher.assignment.solve_assignment`
+# import path stable for the UI and tests.
+from hungarian import solve_assignment  # noqa: E402, F401
