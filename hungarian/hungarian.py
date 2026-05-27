@@ -78,8 +78,6 @@ def _hungarian(cost_matrix: list[list[float]]) -> Assignment:
     This is the core Munkres algorithm using augmenting paths.
     """
     n = len(cost_matrix)
-    # Create a working copy as a mutable 2D list
-    C = [row[:] for row in cost_matrix]
 
     u = [0.0] * (n + 1)  # Dual variable for rows
     v = [0.0] * (n + 1)  # Dual variable for cols
@@ -100,7 +98,7 @@ def _hungarian(cost_matrix: list[list[float]]) -> Assignment:
 
             for j in range(1, n + 1):
                 if not used[j]:
-                    cur = C[i0 - 1][j - 1] - u[i0] - v[j]
+                    cur = cost_matrix[i0 - 1][j - 1] - u[i0] - v[j]
                     if cur < minv[j]:
                         minv[j] = cur
                         way[j] = j0
